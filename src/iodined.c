@@ -51,10 +51,6 @@
 
 #include "dns.h"
 #include "encoding.h"
-#include "base32.h"
-#include "base64.h"
-#include "base64u.h"
-#include "base128.h"
 #include "user.h"
 #include "login.h"
 #include "tun.h"
@@ -87,10 +83,6 @@ WSADATA wsa_data;
 static int running = 1;
 static char *topdomain;
 static char password[33];
-static struct encoder *b32;
-static struct encoder *b64;
-static struct encoder *b64u;
-static struct encoder *b128;
 static int created_users;
 
 static int check_ip;
@@ -105,6 +97,8 @@ static int debug;
 
 #if !defined(BSD) && !defined(__GLIBC__)
 static char *__progname;
+#else
+extern char *__progname;
 #endif
 
 /* Struct with IPv4 and IPv6 file descriptors.
@@ -117,7 +111,7 @@ struct dnsfd {
 };
 
 static int read_dns(int fd, struct dnsfd *dns_fds, int tun_fd, struct query *q);
-static void write_dns(int fd, struct query *q, char *data, int datalen, char downenc);
+static void write_dns(int fd, struct query *q, const char *data, int datalen, char downenc);
 static void handle_full_packet(int tun_fd, struct dnsfd *dns_fds, int userid);
 
 static int
@@ -197,17 +191,15 @@ sigint(int sig)
 #define	LOG_NOTICE	5
 #define	LOG_INFO	6
 #define	LOG_DEBUG	7
-static void
-syslog(int a, const char *str, ...)
+
+static void syslog(int a, const char *str, ...)
 {
 	/* TODO: implement (add to event log), move to common.c */
-	;
 }
 #endif
 
 /* This will not check that user has passed login challenge */
-static int
-check_user_and_ip(int userid, struct query *q)
+static int check_user_and_ip(int userid, struct query *q)
 {
 	/* Note: duplicate in handle_raw_login() except IP-address check */
 
@@ -250,8 +242,7 @@ check_user_and_ip(int userid, struct query *q)
 }
 
 /* This checks that user has passed normal (non-raw) login challenge */
-static int
-check_authenticated_user_and_ip(int userid, struct query *q)
+static int check_authenticated_user_and_ip(int userid, struct query *q)
 {
 	int res = check_user_and_ip(userid, q);
 	if (res)
@@ -263,8 +254,19 @@ check_authenticated_user_and_ip(int userid, struct query *q)
 	return 0;
 }
 
-static void
-send_raw(int fd, char *buf, int buflen, int user, int cmd, struct query *q)
+static int check_authenticated_user_and_ip_and_options(int userid, struct query *q)
+{
+	int res = check_authenticated_user_and_ip(userid, q);
+	if (res || check_ip)
+		return res;
+
+	if (users[userid].options_locked)
+		return 1;
+
+	return 0;
+}
+
+static void send_raw(int fd, char *buf, int buflen, int user, int cmd, struct query *q)
 {
 	char packet[4096];
 	int len;
@@ -288,8 +290,7 @@ send_raw(int fd, char *buf, int buflen, int user, int cmd, struct query *q)
 }
 
 
-static void
-start_new_outpacket(int userid, char *data, int datalen)
+static void start_new_outpacket(int userid, char *data, int datalen)
 /* Copies data to .outpacket and resets all counters.
    data is expected to be compressed already. */
 {
@@ -305,8 +306,7 @@ start_new_outpacket(int userid, char *data, int datalen)
 
 #ifdef OUTPACKETQ_LEN
 
-static int
-save_to_outpacketq(int userid, char *data, int datalen)
+static int save_to_outpacketq(int userid, char *data, int datalen)
 /* Find space in outpacket-queue and store data (expected compressed already).
    Returns: 1 = okay, 0 = no space. */
 {
@@ -334,8 +334,7 @@ save_to_outpacketq(int userid, char *data, int datalen)
 	return 1;
 }
 
-static int
-get_from_outpacketq(int userid)
+static int get_from_outpacketq(int userid)
 /* Starts new outpacket from queue, if any.
    Returns: 1 = okay, 0 = no packets were waiting. */
 {
@@ -382,8 +381,7 @@ get_from_outpacketq(int userid)
    number, and of course data.)
 */
 
-static void
-save_to_dnscache(int userid, struct query *q, char *answer, int answerlen)
+static void save_to_dnscache(int userid, struct query *q, char *answer, int answerlen)
 /* Store answer in our little DNS cache. */
 {
 	int fill;
@@ -402,8 +400,7 @@ save_to_dnscache(int userid, struct query *q, char *answer, int answerlen)
 	users[userid].dnscache_lastfilled = fill;
 }
 
-static int
-answer_from_dnscache(int dns_fd, int userid, struct query *q)
+static int answer_from_dnscache(int dns_fd, int userid, struct query *q)
 /* Checks cache and sends repeated answer if we alreay saw this query recently.
    Returns: 1 = answer sent, drop this query, 0 = no answer sent, this is
    a new query. */
@@ -444,10 +441,11 @@ answer_from_dnscache(int dns_fd, int userid, struct query *q)
 
 #endif /* DNSCACHE_LEN */
 
-static inline void
-save_to_qmem(unsigned char *qmem_cmc, unsigned short *qmem_type, int qmem_len,
-	     int *qmem_lastfilled, unsigned char *cmc_to_add,
-	     unsigned short type_to_add)
+static inline void save_to_qmem(unsigned char *qmem_cmc,
+				unsigned short *qmem_type, int qmem_len,
+				int *qmem_lastfilled,
+				unsigned char *cmc_to_add,
+				unsigned short type_to_add)
 /* Remember query to check for duplicates */
 {
 	int fill;
@@ -461,8 +459,7 @@ save_to_qmem(unsigned char *qmem_cmc, unsigned short *qmem_type, int qmem_len,
 	*qmem_lastfilled = fill;
 }
 
-static inline void
-save_to_qmem_pingordata(int userid, struct query *q)
+static inline void save_to_qmem_pingordata(int userid, struct query *q)
 {
 	/* Our CMC is a bit more than the "official" CMC; we store 4 bytes
 	   just because we can, and because it may prevent some false matches.
@@ -485,7 +482,7 @@ save_to_qmem_pingordata(int userid, struct query *q)
 
 		/* We already unpacked in handle_null_request(), but that's
 		   lost now... Note: b32 directly, we want no undotify here! */
-		i = b32->decode(cmc, &cmcsize, q->name + 1, (cp - q->name) - 1);
+		i = base32_ops.decode(cmc, &cmcsize, q->name + 1, (cp - q->name) - 1);
 
 		if (i < 4)
 			return;	 /* illegal ping; shouldn't happen */
@@ -517,10 +514,9 @@ save_to_qmem_pingordata(int userid, struct query *q)
 	}
 }
 
-static int
-answer_from_qmem(int dns_fd, struct query *q, unsigned char *qmem_cmc,
-		 unsigned short *qmem_type, int qmem_len,
-		 unsigned char *cmc_to_check)
+static int answer_from_qmem(int dns_fd, struct query *q,
+			    unsigned char *qmem_cmc, unsigned short *qmem_type,
+			    int qmem_len, unsigned char *cmc_to_check)
 /* Checks query memory and sends an (illegal) answer if this is a duplicate.
    Returns: 1 = answer sent, drop this query, 0 = no answer sent, this is
    not a duplicate. */
@@ -550,9 +546,9 @@ answer_from_qmem(int dns_fd, struct query *q, unsigned char *qmem_cmc,
 	return 0;
 }
 
-static inline int
-answer_from_qmem_data(int dns_fd, int userid, struct query *q)
 /* Quick helper function to keep handle_null_request() clean */
+static inline int answer_from_qmem_data(int dns_fd, int userid,
+					struct query *q)
 {
 	char cmc[4];
 	int i;
@@ -568,8 +564,6 @@ answer_from_qmem_data(int dns_fd, int userid, struct query *q)
 				(void *) cmc);
 }
 
-static int
-send_chunk_or_dataless(int dns_fd, int userid, struct query *q)
 /* Sends current fragment to user, or dataless packet if there is no
    current fragment available (-> normal "quiet" ping reply).
    Does not update anything, except:
@@ -579,6 +573,7 @@ send_chunk_or_dataless(int dns_fd, int userid, struct query *q)
    Returns: 1 = can call us again immediately, new packet from queue;
    0 = don't call us again for now.
 */
+static int send_chunk_or_dataless(int dns_fd, int userid, struct query *q)
 {
 	char pkt[4096];
 	int datalen = 0;
@@ -662,8 +657,7 @@ send_chunk_or_dataless(int dns_fd, int userid, struct query *q)
 	return 0;	/* don't call us again */
 }
 
-static int
-tunnel_tun(int tun_fd, struct dnsfd *dns_fds)
+static int tunnel_tun(int tun_fd, struct dnsfd *dns_fds)
 {
 	unsigned long outlen;
 	struct ip *header;
@@ -720,8 +714,8 @@ typedef enum {
 	VERSION_FULL
 } version_ack_t;
 
-static void
-send_version_response(int fd, version_ack_t ack, uint32_t payload, int userid, struct query *q)
+static void send_version_response(int fd, version_ack_t ack, uint32_t payload,
+				  int userid, struct query *q)
 {
 	char out[9];
 
@@ -746,12 +740,11 @@ send_version_response(int fd, version_ack_t ack, uint32_t payload, int userid, s
 	write_dns(fd, q, out, sizeof(out), users[userid].downenc);
 }
 
-static void
-process_downstream_ack(int userid, int down_seq, int down_frag)
 /* Process acks from downstream fragments.
    After this, .offset and .fragment are updated (if ack correct),
    or .len is set to zero when all is done.
 */
+static void process_downstream_ack(int userid, int down_seq, int down_frag)
 {
 	if (users[userid].outpacket.len <= 0)
 		/* No packet to apply acks to */
@@ -807,7 +800,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 	if(in[0] == 'V' || in[0] == 'v') {
 		int version = 0;
 
-		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, b32);
+		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, &base32_ops);
 		/* Version greeting, compare and send ack/nak */
 		if (read > 4) {
 			/* Received V + 32bits version */
@@ -828,7 +821,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 				users[userid].hostlen = q->fromlen;
 
 				memcpy(&(users[userid].q), q, sizeof(struct query));
-				users[userid].encoder = get_base32_encoder();
+				users[userid].encoder = &base32_ops;
 				users[userid].downenc = 'T';
 				send_version_response(dns_fd, VERSION_ACK, users[userid].seed, userid, q);
 				syslog(LOG_INFO, "accepted version for user #%d from %s",
@@ -883,7 +876,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 		}
 		return;
 	} else if(in[0] == 'L' || in[0] == 'l') {
-		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, b32);
+		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, &base32_ops);
 		if (read < 17) {
 			write_dns(dns_fd, q, "BADLEN", 6, 'T');
 			return;
@@ -965,7 +958,8 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 		return;
 	} else if(in[0] == 'S' || in[0] == 's') {
 		int codec;
-		struct encoder *enc;
+		const struct encoder *enc;
+
 		if (domain_len < 3) { /* len at least 3, example: "S15" */
 			write_dns(dns_fd, q, "BADLEN", 6, 'T');
 			return;
@@ -973,7 +967,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 
 		userid = b32_8to5(in[1]);
 
-		if (check_authenticated_user_and_ip(userid, q) != 0) {
+		if (check_authenticated_user_and_ip_and_options(userid, q) != 0) {
 			write_dns(dns_fd, q, "BADIP", 5, 'T');
 			return; /* illegal id */
 		}
@@ -982,22 +976,22 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 
 		switch (codec) {
 		case 5: /* 5 bits per byte = base32 */
-			enc = get_base32_encoder();
+			enc = &base32_ops;
 			user_switch_codec(userid, enc);
 			write_dns(dns_fd, q, enc->name, strlen(enc->name), users[userid].downenc);
 			break;
 		case 6: /* 6 bits per byte = base64 */
-			enc = get_base64_encoder();
+			enc = &base64_ops;
 			user_switch_codec(userid, enc);
 			write_dns(dns_fd, q, enc->name, strlen(enc->name), users[userid].downenc);
 			break;
 		case 26: /* "2nd" 6 bits per byte = base64u, with underscore */
-			enc = get_base64u_encoder();
+			enc = &base64u_ops;
 			user_switch_codec(userid, enc);
 			write_dns(dns_fd, q, enc->name, strlen(enc->name), users[userid].downenc);
 			break;
 		case 7: /* 7 bits per byte = base128 */
-			enc = get_base128_encoder();
+			enc = &base128_ops;
 			user_switch_codec(userid, enc);
 			write_dns(dns_fd, q, enc->name, strlen(enc->name), users[userid].downenc);
 			break;
@@ -1014,7 +1008,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 
 		userid = b32_8to5(in[1]);
 
-		if (check_authenticated_user_and_ip(userid, q) != 0) {
+		if (check_authenticated_user_and_ip_and_options(userid, q) != 0) {
 			write_dns(dns_fd, q, "BADIP", 5, 'T');
 			return; /* illegal id */
 		}
@@ -1168,7 +1162,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 	} else if(in[0] == 'N' || in[0] == 'n') {
 		int max_frag_size;
 
-		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, b32);
+		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, &base32_ops);
 
 		if (read < 3) {
 			write_dns(dns_fd, q, "BADLEN", 6, 'T');
@@ -1177,7 +1171,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 
 		/* Downstream fragsize packet */
 		userid = unpacked[0];
-		if (check_authenticated_user_and_ip(userid, q) != 0) {
+		if (check_authenticated_user_and_ip_and_options(userid, q) != 0) {
 			write_dns(dns_fd, q, "BADIP", 5, 'T');
 			return; /* illegal id */
 		}
@@ -1187,6 +1181,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 			write_dns(dns_fd, q, "BADFRAG", 7, users[userid].downenc);
 		} else {
 			users[userid].fragsize = max_frag_size;
+			users[userid].options_locked = 1;
 			write_dns(dns_fd, q, &unpacked[1], 2, users[userid].downenc);
 		}
 		return;
@@ -1204,7 +1199,7 @@ handle_null_request(int tun_fd, int dns_fd, struct dnsfd *dns_fds, struct query 
 		if (q->id == 0)
 			return;
 
-		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, b32);
+		read = unpack_data(unpacked, sizeof(unpacked), &(in[1]), domain_len - 1, &base32_ops);
 		if (read < 4)
 			return;
 
@@ -1844,10 +1839,10 @@ tunnel(int tun_fd, struct dnsfd *dns_fds, int bind_fd, int max_idle_time)
 			if (FD_ISSET(tun_fd, &fds)) {
 				tunnel_tun(tun_fd, dns_fds);
 			}
-			if (FD_ISSET(dns_fds->v4fd, &fds)) {
+			if (dns_fds->v4fd >= 0 && FD_ISSET(dns_fds->v4fd, &fds)) {
 				tunnel_dns(tun_fd, dns_fds->v4fd, dns_fds, bind_fd);
 			}
-			if (FD_ISSET(dns_fds->v6fd, &fds)) {
+			if (dns_fds->v6fd >= 0 && FD_ISSET(dns_fds->v6fd, &fds)) {
 				tunnel_dns(tun_fd, dns_fds->v6fd, dns_fds, bind_fd);
 			}
 			if (FD_ISSET(bind_fd, &fds)) {
@@ -2086,7 +2081,7 @@ read_dns(int fd, struct dnsfd *dns_fds, int tun_fd, struct query *q)
 		if (raw_decode(packet, r, q, fd, dns_fds, tun_fd)) {
 			return 0;
 		}
-		if (dns_decode(NULL, 0, q, QR_QUERY, packet, r) < 0) {
+		if (dns_decode(NULL, 0, q, QR_QUERY, packet, r) <= 0) {
 			return 0;
 		}
 
@@ -2129,7 +2124,7 @@ read_dns(int fd, struct dnsfd *dns_fds, int tun_fd, struct query *q)
 }
 
 static size_t
-write_dns_nameenc(char *buf, size_t buflen, char *data, int datalen, char downenc)
+write_dns_nameenc(char *buf, size_t buflen, const char *data, int datalen, char downenc)
 /* Returns #bytes of data that were encoded */
 {
 	static int td1 = 0;
@@ -2154,31 +2149,31 @@ write_dns_nameenc(char *buf, size_t buflen, char *data, int datalen, char downen
 
 	if (downenc == 'S') {
 		buf[0] = 'i';
-		if (!b64->places_dots())
+		if (!base64_ops.places_dots)
 			space -= (space / 57);	/* space for dots */
-		b64->encode(buf+1, &space, data, datalen);
-		if (!b64->places_dots())
+		base64_ops.encode(buf+1, &space, data, datalen);
+		if (!base64_ops.places_dots)
 			inline_dotify(buf, buflen);
 	} else if (downenc == 'U') {
 		buf[0] = 'j';
-		if (!b64u->places_dots())
+		if (!base64u_ops.places_dots)
 			space -= (space / 57);	/* space for dots */
-		b64u->encode(buf+1, &space, data, datalen);
-		if (!b64u->places_dots())
+		base64u_ops.encode(buf+1, &space, data, datalen);
+		if (!base64u_ops.places_dots)
 			inline_dotify(buf, buflen);
 	} else if (downenc == 'V') {
 		buf[0] = 'k';
-		if (!b128->places_dots())
+		if (!base128_ops.places_dots)
 			space -= (space / 57);	/* space for dots */
-		b128->encode(buf+1, &space, data, datalen);
-		if (!b128->places_dots())
+		base128_ops.encode(buf+1, &space, data, datalen);
+		if (!base128_ops.places_dots)
 			inline_dotify(buf, buflen);
 	} else {
 		buf[0] = 'h';
-		if (!b32->places_dots())
+		if (!base32_ops.places_dots)
 			space -= (space / 57);	/* space for dots */
-		b32->encode(buf+1, &space, data, datalen);
-		if (!b32->places_dots())
+		base32_ops.encode(buf+1, &space, data, datalen);
+		if (!base32_ops.places_dots)
 			inline_dotify(buf, buflen);
 	}
 
@@ -2199,7 +2194,7 @@ write_dns_nameenc(char *buf, size_t buflen, char *data, int datalen, char downen
 }
 
 static void
-write_dns(int fd, struct query *q, char *data, int datalen, char downenc)
+write_dns(int fd, struct query *q, const char *data, int datalen, char downenc)
 {
 	char buf[64*1024];
 	int len = 0;
@@ -2249,15 +2244,15 @@ write_dns(int fd, struct query *q, char *data, int datalen, char downenc)
 
 		if (downenc == 'S') {
 			txtbuf[0] = 's';	/* plain base64(Sixty-four) */
-			len = b64->encode(txtbuf+1, &space, data, datalen);
+			len = base64_ops.encode(txtbuf+1, &space, data, datalen);
 		}
 		else if (downenc == 'U') {
 			txtbuf[0] = 'u';	/* Base64 with Underscore */
-			len = b64u->encode(txtbuf+1, &space, data, datalen);
+			len = base64u_ops.encode(txtbuf+1, &space, data, datalen);
 		}
 		else if (downenc == 'V') {
 			txtbuf[0] = 'v';	/* Base128 */
-			len = b128->encode(txtbuf+1, &space, data, datalen);
+			len = base128_ops.encode(txtbuf+1, &space, data, datalen);
 		}
 		else if (downenc == 'R') {
 			txtbuf[0] = 'r';	/* Raw binary data */
@@ -2265,7 +2260,7 @@ write_dns(int fd, struct query *q, char *data, int datalen, char downenc)
 			memcpy(txtbuf + 1, data, len);
 		} else {
 			txtbuf[0] = 't';	/* plain base32(Thirty-two) */
-			len = b32->encode(txtbuf+1, &space, data, datalen);
+			len = base32_ops.encode(txtbuf+1, &space, data, datalen);
 		}
 		len = dns_encode(buf, sizeof(buf), q, QR_ANSWER, txtbuf, len+1);
 	} else {
@@ -2286,69 +2281,67 @@ write_dns(int fd, struct query *q, char *data, int datalen, char downenc)
 	sendto(fd, buf, len, 0, (struct sockaddr*)&q->from, q->fromlen);
 }
 
-static void
-print_usage() {
-	extern char *__progname;
-
-	fprintf(stderr, "Usage: %s [-v] [-h] "
-		"[-4] [-6] [-c] [-s] [-f] [-D] [-u user] "
-		"[-t chrootdir] [-d device] [-m mtu] [-z context] "
-		"[-l ipv4 listen address] [-L ipv6 listen address] "
-		"[-p port] [-n external ip] [-b dnsport] "
-		"[-P password] [-F pidfile] [-i max idle time] "
-		"tunnel_ip[/netmask] topdomain\n", __progname);
+static void print_usage(FILE *stream)
+{
+	fprintf(stream, "Usage: %s [-46cDfsv] [-u user] [-t chrootdir] [-d device] [-m mtu]\n"
+			"               [-z context] [-l ipv4 listen address] [-L ipv6 listen address]\n"
+			"               [-p port] [-n external ip] [-b dnsport] [-P password]\n"
+			"               [-F pidfile] [-i max idle time] tunnel_ip[/netmask] topdomain\n",
+			__progname);
 }
 
-static void
-usage() {
-	print_usage();
+static void usage(void)
+{
+	print_usage(stderr);
 	exit(2);
 }
 
-static void
-help() {
-	fprintf(stderr, "iodine IP over DNS tunneling server\n");
-	print_usage();
-	fprintf(stderr, "  -v to print version info and exit\n");
-	fprintf(stderr, "  -h to print this help and exit\n");
-	fprintf(stderr, "  -4 to listen only on IPv4\n");
-	fprintf(stderr, "  -6 to listen only on IPv6\n");
-	fprintf(stderr, "  -c to disable check of client IP/port on each request\n");
-	fprintf(stderr, "  -s to skip creating and configuring the tun device, "
-		"which then has to be created manually\n");
-	fprintf(stderr, "  -f to keep running in foreground\n");
-	fprintf(stderr, "  -D to increase debug level\n");
-	fprintf(stderr, "     (using -DD in UTF-8 terminal: \"LC_ALL=C luit iodined -DD ...\")\n");
-	fprintf(stderr, "  -u name to drop privileges and run as user 'name'\n");
-	fprintf(stderr, "  -t dir to chroot to directory dir\n");
-	fprintf(stderr, "  -d device to set tunnel device name\n");
-	fprintf(stderr, "  -m mtu to set tunnel device mtu\n");
-	fprintf(stderr, "  -z context to apply SELinux context after initialization\n");
-	fprintf(stderr, "  -l IPv4 address to listen on for incoming dns traffic "
-		"(default 0.0.0.0)\n");
-	fprintf(stderr, "  -L IPv6 address to listen on for incoming dns traffic "
-		"(default ::)\n");
-	fprintf(stderr, "  -p port to listen on for incoming dns traffic (default 53)\n");
-	fprintf(stderr, "  -n ip to respond with to NS queries\n");
-	fprintf(stderr, "  -b port to forward normal DNS queries to (on localhost)\n");
-	fprintf(stderr, "  -P password used for authentication (max 32 chars will be used)\n");
-	fprintf(stderr, "  -F pidfile to write pid to a file\n");
-	fprintf(stderr, "  -i maximum idle time before shutting down\n");
-	fprintf(stderr, "tunnel_ip is the IP number of the local tunnel interface.\n");
-	fprintf(stderr, "   /netmask sets the size of the tunnel network.\n");
-	fprintf(stderr, "topdomain is the FQDN that is delegated to this server.\n");
+static void help(FILE *stream)
+{
+	fprintf(stream, "iodine IP over DNS tunneling server\n\n");
+	print_usage(stream);
+	fprintf(stream, "\nAvailable options:\n"
+			"  -v to print version info and exit\n"
+			"  -h to print this help and exit\n"
+			"  -4 to listen only on IPv4\n"
+			"  -6 to listen only on IPv6\n"
+			"  -c to disable check of client IP/port on each request\n"
+			"  -s to skip creating and configuring the tun device,\n"
+			"     which then has to be created manually\n"
+			"  -f to keep running in foreground\n"
+			"  -D to increase debug level\n"
+			"     (using -DD in UTF-8 terminal: \"LC_ALL=C luit iodined -DD ...\")\n"
+			"  -u name to drop privileges and run as user 'name'\n"
+			"  -t dir to chroot to directory dir\n"
+			"  -d device to set tunnel device name\n"
+			"  -m mtu to set tunnel device mtu\n"
+			"  -z context to apply SELinux context after initialization\n"
+			"  -l IPv4 address to listen on for incoming dns traffic "
+			"(default 0.0.0.0)\n"
+			"  -L IPv6 address to listen on for incoming dns traffic "
+			"(default ::)\n"
+			"  -p port to listen on for incoming dns traffic (default 53)\n"
+			"  -n ip to respond with to NS queries\n"
+			"  -b port to forward normal DNS queries to (on localhost)\n"
+			"  -P password used for authentication (max 32 chars will be used)\n"
+			"  -F pidfile to write pid to a file\n"
+			"  -i maximum idle time before shutting down\n\n"
+			"tunnel_ip is the IP number of the local tunnel interface.\n"
+			"   /netmask sets the size of the tunnel network.\n"
+			"topdomain is the FQDN that is delegated to this server.\n");
+
 	exit(0);
 }
 
-static void
-version() {
-	fprintf(stderr, "iodine IP over DNS tunneling server\n");
-	fprintf(stderr, "Git version: %s\n", GITREVISION);
+static void version(void)
+{
+	fprintf(stderr, "iodine IP over DNS tunneling server\n"
+			"Git version: %s\n", GITREVISION);
+
 	exit(0);
 }
 
-static void
-prepare_dns_fd(int fd)
+static void prepare_dns_fd(int fd)
 {
 #ifndef WINDOWS32
 	int flag = 1;
@@ -2368,7 +2361,6 @@ prepare_dns_fd(int fd)
 int
 main(int argc, char **argv)
 {
-	extern char *__progname;
 	char *listen_ip4;
 	char *listen_ip6;
 	char *errormsg;
@@ -2431,11 +2423,6 @@ main(int argc, char **argv)
 	netmask = 27;
 	pidfile = NULL;
 
-	b32 = get_base32_encoder();
-	b64 = get_base64_encoder();
-	b64u = get_base64u_encoder();
-	b128 = get_base128_encoder();
-
 	retval = 0;
 
 #ifdef WINDOWS32
@@ -2450,7 +2437,6 @@ main(int argc, char **argv)
 		__progname++;
 #endif
 
-	memset(password, 0, sizeof(password));
 	srand(time(NULL));
 	fw_query_init();
 
@@ -2475,7 +2461,7 @@ main(int argc, char **argv)
 			foreground = 1;
 			break;
 		case 'h':
-			help();
+			help(stdout);
 			break;
 		case 'D':
 			debug++;
@@ -2537,7 +2523,7 @@ main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
-	check_superuser(usage);
+	check_superuser();
 
 	if (argc != 2)
 		usage();
@@ -2592,16 +2578,19 @@ main(int argc, char **argv)
 		fprintf(stderr, "Add more -D switches to set higher debug level.\n");
 		foreground = 1;
 	}
-
-	dns4addr_len = get_addr(listen_ip4, port, AF_INET, AI_PASSIVE | AI_NUMERICHOST, &dns4addr);
-	if (dns4addr_len < 0) {
-		warnx("Bad IPv4 address to listen on.");
-		usage();
+	if (addrfamily == AF_UNSPEC || addrfamily == AF_INET) {
+	        dns4addr_len = get_addr(listen_ip4, port, AF_INET, AI_PASSIVE | AI_NUMERICHOST, &dns4addr);
+		if (dns4addr_len < 0) {
+		  warnx("Bad IPv4 address to listen on.");
+		  usage();
+		}
 	}
-	dns6addr_len = get_addr(listen_ip6, port, AF_INET6, AI_PASSIVE | AI_NUMERICHOST, &dns6addr);
-	if (dns6addr_len < 0) {
-		warnx("Bad IPv6 address to listen on.");
-		usage();
+	if (addrfamily == AF_UNSPEC || addrfamily == AF_INET6) {
+	        dns6addr_len = get_addr(listen_ip6, port, AF_INET6, AI_PASSIVE | AI_NUMERICHOST, &dns6addr);
+		if (dns6addr_len < 0) {
+		  warnx("Bad IPv6 address to listen on.");
+		  usage();
+		}
 	}
 
 	if(bind_enable) {
@@ -2671,14 +2660,11 @@ main(int argc, char **argv)
 
 #ifdef HAVE_SYSTEMD
 	nb_fds = sd_listen_fds(0);
-	if (nb_fds > 1) {
+	if (nb_fds < 0) {
+		warnx("Failed to receive file descriptors from systemd: %s", strerror(-nb_fds));
 		retval = 1;
-		warnx("Too many file descriptors received!\n");
 		goto cleanup;
-	} else if (nb_fds == 1) {
-		/* XXX: assume we get IPv4 socket */
-		dns_fds.v4fd = SD_LISTEN_FDS_START;
-	} else {
+	} else if (nb_fds == 0) {
 #endif
 		if ((addrfamily == AF_UNSPEC || addrfamily == AF_INET) &&
 			(dns_fds.v4fd = open_dns(&dns4addr, dns4addr_len)) < 0) {
@@ -2694,6 +2680,25 @@ main(int argc, char **argv)
 			goto cleanup;
 		}
 #ifdef HAVE_SYSTEMD
+	} else if (nb_fds <= 2) {
+		/* systemd may pass up to two sockets, for ip4 and ip6, try to figure out
+			which is which */
+		for (int i = 0; i < nb_fds; i++) {
+			int fd = SD_LISTEN_FDS_START + i;
+			if (sd_is_socket(fd, AF_INET, SOCK_DGRAM, -1)) {
+				dns_fds.v4fd = fd;
+			} else if (sd_is_socket(fd, AF_INET6, SOCK_DGRAM, -1)) {
+				dns_fds.v6fd = fd;
+			} else {
+				retval = 1;
+				warnx("Unknown socket %d passed to iodined!\n", fd);
+				goto cleanup;
+			}
+		}
+	} else {
+		retval = 1;
+		warnx("Too many file descriptors received!\n");
+		goto cleanup;
 	}
 #endif
 

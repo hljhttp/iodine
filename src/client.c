@@ -47,10 +47,6 @@
 
 #include "common.h"
 #include "encoding.h"
-#include "base32.h"
-#include "base64.h"
-#include "base64u.h"
-#include "base128.h"
 #include "dns.h"
 #include "login.h"
 #include "tun.h"
@@ -85,16 +81,9 @@ static uint16_t chunkid;
 static uint16_t chunkid_prev;
 static uint16_t chunkid_prev2;
 
-/* Base32 encoder used for non-data packets and replies */
-static struct encoder *b32;
-/* Base64 etc encoders for replies */
-static struct encoder *b64;
-static struct encoder *b64u;
-static struct encoder *b128;
-
 /* The encoder used for data packets
  * Defaults to Base32, can be changed after handshake */
-static struct encoder *dataenc;
+const static struct encoder *dataenc = &base32_ops;
 
 /* The encoder to use for downstream data */
 static char downenc = ' ';
@@ -117,11 +106,6 @@ void
 client_init()
 {
 	running = 1;
-	b32 = get_base32_encoder();
-	b64 = get_base64_encoder();
-	b64u = get_base64u_encoder();
-	b128 = get_base128_encoder();
-	dataenc = get_base32_encoder();
 	rand_seed = ((unsigned int) rand()) & 0xFFFF;
 	send_ping_soon = 1;	/* send ping immediately after startup */
 	conn = CONN_DNS_NULL;
@@ -342,12 +326,11 @@ send_packet(int fd, char cmd, const char *data, const size_t datalen)
 	buf[0] = cmd;
 
 	build_hostname(buf + 1, sizeof(buf) - 1, data, datalen, topdomain,
-		       b32, hostname_maxlen);
+		       &base32_ops, hostname_maxlen);
 	send_query(fd, buf);
 }
 
-static inline int
-is_sending()
+static inline int is_sending(void)
 {
 	return (outpkt.len != 0);
 }
@@ -481,7 +464,7 @@ dns_namedec(char *outdata, int outdatalen, char *buf, int buflen)
 
 		/* this also does undotify */
 		return unpack_data(outdata, outdatalen, buf + 1, buflen - 4,
-				   b32);
+				   &base32_ops);
 
 	case 'i': /* Hostname++ with base64 */
 	case 'I':
@@ -491,7 +474,7 @@ dns_namedec(char *outdata, int outdatalen, char *buf, int buflen)
 
 		/* this also does undotify */
 		return unpack_data(outdata, outdatalen, buf + 1, buflen - 4,
-				   b64);
+				   &base64_ops);
 
 	case 'j': /* Hostname++ with base64u */
 	case 'J':
@@ -501,7 +484,7 @@ dns_namedec(char *outdata, int outdatalen, char *buf, int buflen)
 
 		/* this also does undotify */
 		return unpack_data(outdata, outdatalen, buf + 1, buflen - 4,
-				   b64u);
+				   &base64u_ops);
 
 	case 'k': /* Hostname++ with base128 */
 	case 'K':
@@ -511,35 +494,35 @@ dns_namedec(char *outdata, int outdatalen, char *buf, int buflen)
 
 		/* this also does undotify */
 		return unpack_data(outdata, outdatalen, buf + 1, buflen - 4,
-				   b128);
+				   &base128_ops);
 
 	case 't': /* plain base32(Thirty-two) from TXT */
 	case 'T':
 		if (buflen < 2)
 			return 0;
 
-		return b32->decode(outdata, &outdatalenu, buf + 1, buflen - 1);
+		return base32_ops.decode(outdata, &outdatalenu, buf + 1, buflen - 1);
 
 	case 's': /* plain base64(Sixty-four) from TXT */
 	case 'S':
 		if (buflen < 2)
 			return 0;
 
-		return b64->decode(outdata, &outdatalenu, buf + 1, buflen - 1);
+		return base64_ops.decode(outdata, &outdatalenu, buf + 1, buflen - 1);
 
 	case 'u': /* plain base64u (Underscore) from TXT */
 	case 'U':
 		if (buflen < 2)
 			return 0;
 
-		return b64u->decode(outdata, &outdatalenu, buf + 1, buflen - 1);
+		return base64_ops.decode(outdata, &outdatalenu, buf + 1, buflen - 1);
 
 	case 'v': /* plain base128 from TXT */
 	case 'V':
 		if (buflen < 2)
 			return 0;
 
-		return b128->decode(outdata, &outdatalenu, buf + 1, buflen - 1);
+		return base128_ops.decode(outdata, &outdatalenu, buf + 1, buflen - 1);
 
 	case 'r': /* Raw binary from TXT */
 	case 'R':
@@ -1297,7 +1280,7 @@ send_raw_udp_login(int dns_fd, int userid, int seed)
 }
 
 static void
-send_upenctest(int fd, char *s)
+send_upenctest(int fd, const char *s)
 /* NOTE: String may be at most 63-4=59 chars to fit in 1 dns chunk. */
 {
 	char buf[512] = "z___";
@@ -1574,7 +1557,7 @@ handshake_raw_udp(int dns_fd, int seed)
 }
 
 static int
-handshake_upenctest(int dns_fd, char *s)
+handshake_upenctest(int dns_fd, const char *s)
 /* NOTE: *s may be max 59 chars; must start with "aA" for case-swap check
    Returns:
    -1: case swap, no need for any further test: error printed; or Ctrl-C
@@ -1584,7 +1567,7 @@ handshake_upenctest(int dns_fd, char *s)
 {
 	char in[4096];
 	unsigned char *uin = (unsigned char *) in;
-	unsigned char *us = (unsigned char *) s;
+	const unsigned char *us = (const unsigned char *) s;
 	int i;
 	int read;
         int slen;
@@ -1666,17 +1649,17 @@ handshake_upenc_autodetect(int dns_fd)
 	   [A-Z] as first, and [A-Z0-9] as last char _per label_.
 	   Test by having '-' as last char.
 	 */
-        char *pat64="aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ+0129-";
-        char *pat64u="aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ_0129-";
-        char *pat128a="aA-Aaahhh-Drink-mal-ein-J\344germeister-";
-        char *pat128b="aA-La-fl\373te-na\357ve-fran\347aise-est-retir\351-\340-Cr\350te";
-        char *pat128c="aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ";
-        char *pat128d="aA0123456789\274\275\276\277"
-		      "\300\301\302\303\304\305\306\307\310\311\312\313\314\315\316\317";
-        char *pat128e="aA"
-		      "\320\321\322\323\324\325\326\327\330\331\332\333\334\335\336\337"
-		      "\340\341\342\343\344\345\346\347\350\351\352\353\354\355\356\357"
-		      "\360\361\362\363\364\365\366\367\370\371\372\373\374\375";
+        const char *pat64 = "aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ+0129-";
+        const char *pat64u = "aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ_0129-";
+        const char *pat128a = "aA-Aaahhh-Drink-mal-ein-J\344germeister-";
+        const char *pat128b = "aA-La-fl\373te-na\357ve-fran\347aise-est-retir\351-\340-Cr\350te";
+        const char *pat128c = "aAbBcCdDeEfFgGhHiIjJkKlLmMnNoOpPqQrRsStTuUvVwWxXyYzZ";
+        const char *pat128d = "aA0123456789\274\275\276\277"
+                              "\300\301\302\303\304\305\306\307\310\311\312\313\314\315\316\317";
+        const char *pat128e="aA"
+		            "\320\321\322\323\324\325\326\327\330\331\332\333\334\335\336\337"
+		            "\340\341\342\343\344\345\346\347\350\351\352\353\354\355\356\357"
+		            "\360\361\362\363\364\365\366\367\370\371\372\373\374\375";
 	int res;
 
 	/* Try Base128, starting very gently to not draw attention */
@@ -2021,16 +2004,16 @@ handshake_switch_codec(int dns_fd, int bits)
 	char in[4096];
 	int i;
 	int read;
-	struct encoder *tempenc;
+	const struct encoder *tempenc;
 
 	if (bits == 5)
-		tempenc = get_base32_encoder();
+		tempenc = &base32_ops;
 	else if (bits == 6)
-		tempenc = get_base64_encoder();
+		tempenc = &base64_ops;
 	else if (bits == 26)	/* "2nd" 6 bits per byte, with underscore */
-		tempenc = get_base64u_encoder();
+		tempenc = &base64u_ops;
 	else if (bits == 7)
-		tempenc = get_base128_encoder();
+		tempenc = &base128_ops;
 	else return;
 
 	fprintf(stderr, "Switching upstream to codec %s\n", tempenc->name);

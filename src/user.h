@@ -39,6 +39,7 @@ struct tun_user {
 	int active;
 	int authenticated;
 	int authenticated_raw;
+	int options_locked;
 	int disabled;
 	time_t last_pkt;
 	int seed;
@@ -51,7 +52,7 @@ struct tun_user {
 	struct packet inpacket;
 	struct packet outpacket;
 	int outfragresent;
-	struct encoder *encoder;
+	const struct encoder *encoder;
 	char downenc;
 	int out_acked_seqno;
 	int out_acked_fragment;
@@ -80,11 +81,11 @@ struct tun_user {
 extern struct tun_user *users;
 
 int init_users(in_addr_t, int);
-const char* users_get_first_ip();
+const char* users_get_first_ip(void);
 int find_user_by_ip(uint32_t);
-int all_users_waiting_to_send();
-int find_available_user();
-void user_switch_codec(int userid, struct encoder *enc);
+int all_users_waiting_to_send(void);
+int find_available_user(void);
+void user_switch_codec(int userid, const struct encoder *enc);
 void user_set_conn_type(int userid, enum connection c);
 
 #endif
